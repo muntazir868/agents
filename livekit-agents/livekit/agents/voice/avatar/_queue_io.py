@@ -33,11 +33,12 @@ class QueueAudioOutput(
             label="DebugQueueIO",
             next_in_chain=None,
             sample_rate=sample_rate,
-            capabilities=AudioOutputCapabilities(pause=False),
+            capabilities=AudioOutputCapabilities(pause=False, flush_ends_segment=True),
         )
         self._wait_playback_start = wait_playback_start
         self._data_ch = utils.aio.Chan[rtc.AudioFrame | AudioSegmentEnd]()
         self._capturing = False
+        self._segment_cleared = False
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
         """Capture and queue audio frame"""
@@ -55,18 +56,29 @@ class QueueAudioOutput(
         if not self._capturing:
             return
         self._capturing = False
-        self._data_ch.send_nowait(AudioSegmentEnd())
+        interrupted, self._segment_cleared = self._segment_cleared, False
+        self._data_ch.send_nowait(AudioSegmentEnd(interrupted=interrupted))
 
     # as AudioReceiver for AvatarRunner
 
     def clear_buffer(self) -> None:
         """Clear the audio buffer"""
+        was_capturing = self._capturing
+        # Close the output's local segment so a later reply is counted separately.
+        # The external clear_buffer event remains the interruption authority.
+        AudioOutput.flush(self)
+        self._capturing = False
+        self._segment_cleared = False
         while True:
             try:
                 self._data_ch.recv_nowait()
             except utils.aio.channel.ChanEmpty:
                 break
-        self.emit("clear_buffer")  # type: ignore
+        if was_capturing:
+            self.emit("clear_buffer")  # type: ignore
+
+    def interrupt_buffer(self) -> None:
+        self.clear_buffer()
 
     def notify_playback_finished(self, playback_position: float, interrupted: bool) -> None:
         self.on_playback_finished(playback_position=playback_position, interrupted=interrupted)

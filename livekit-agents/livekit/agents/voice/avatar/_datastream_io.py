@@ -13,7 +13,7 @@ from livekit import rtc
 from ... import utils
 from ...log import logger
 from ...types import NOT_GIVEN, NotGivenOr
-from ..io import AudioOutput, AudioOutputCapabilities, PlaybackFinishedEvent
+from ..io import AudioOutput, AudioOutputCapabilities, PlaybackFinishedEvent, _CaptureCancelledEvent
 from ._types import AudioReceiver, AudioSegmentEnd
 
 RPC_CLEAR_BUFFER = "lk.clear_buffer"
@@ -53,7 +53,7 @@ class DataStreamAudioOutput(AudioOutput):
             label="DataStreamIO",
             next_in_chain=None,
             sample_rate=sample_rate,
-            capabilities=AudioOutputCapabilities(pause=False),
+            capabilities=AudioOutputCapabilities(pause=False, flush_ends_segment=True),
         )
         self._room = room
         self._destination_identity = destination_identity
@@ -70,7 +70,8 @@ class DataStreamAudioOutput(AudioOutput):
         # a playback finished event is expected after the clear buffer rpc is performed
         # if not received after the timeout, we still mark the playout is done to avoid deadlock
         self._clear_buffer_timeout = clear_buffer_timeout
-        self._clear_buffer_timeout_handler: asyncio.TimerHandle | None = None
+        # Also includes completion of captures canceled behind the clear.
+        self._clear_buffer_atask: asyncio.Task[None] | None = None
 
         def _on_room_connected(fut: asyncio.Future[None]) -> None:
             if not self._start_atask and not fut.cancelled() and not fut.exception():
@@ -147,6 +148,18 @@ class DataStreamAudioOutput(AudioOutput):
         # we want to avoid OOM & outdated speech?
         await asyncio.shield(self._start_atask)
 
+        # Callers must serialize capture calls, including awaiting their cancellation.
+        # Finish the interrupted playback before newer audio can be queued.
+        while self._clear_buffer_atask is not None and not self._clear_buffer_atask.done():
+            try:
+                await asyncio.shield(self._clear_buffer_atask)
+            except asyncio.CancelledError:
+                task = asyncio.create_task(self._finish_cancelled_capture(self._clear_buffer_atask))
+                self._clear_buffer_atask = task
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+                raise
+
         await super().capture_frame(frame)
 
         if not self._stream_writer:
@@ -168,6 +181,13 @@ class DataStreamAudioOutput(AudioOutput):
         await self._stream_writer.write(bytes(frame.data))
         self._pushed_duration += frame.duration
 
+    async def _finish_cancelled_capture(self, clear_task: asyncio.Task[None]) -> None:
+        """Finish the zero-audio segment reserved by wrappers for a canceled capture."""
+        await asyncio.shield(clear_task)
+        self._dispatch_playback_finished(
+            _CaptureCancelledEvent(playback_position=0, interrupted=True)
+        )
+
     def flush(self) -> None:
         """Mark end of current audio segment"""
         super().flush()
@@ -182,12 +202,55 @@ class DataStreamAudioOutput(AudioOutput):
         self._stream_writer = None
 
     def clear_buffer(self) -> None:
+        if not self._started or not self._pending_playback_count:
+            return
+        if self._clear_buffer_atask is not None and not self._clear_buffer_atask.done():
+            return
+
+        task = asyncio.create_task(
+            self._clear_buffer_task(self._pushed_duration, self.captured_playout_segments)
+        )
+        # With no fallback, later captures must not wait for remote completion.
+        if self._clear_buffer_timeout is not None:
+            self._clear_buffer_atask = task
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def interrupt_buffer(self) -> None:
+        """Discard an interrupted stream without publishing a normal end-of-speech."""
         if not self._started:
             return
 
-        task = asyncio.create_task(self._clear_buffer_task(self._pushed_duration))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        writer = self._stream_writer
+        pushed_duration = self._pushed_duration
+        # Retire the writer before the clear RPC: the next capture must open a new
+        # stream, because the receiver discards every remaining byte of this one.
+        self._stream_writer = None
+        self._pushed_duration = 0.0
+        # Reset only local capture bookkeeping. Do not call self.flush(): closing
+        # the writer through the normal path would signal end-of-speech.
+        AudioOutput.flush(self)
+        self.clear_buffer()
+
+        if writer is not None:
+            task = asyncio.create_task(self._discard_interrupted_stream(writer, pushed_duration))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _discard_interrupted_stream(
+        self, writer: rtc.ByteStreamWriter, pushed_duration: float
+    ) -> None:
+        """Close the retired writer after the clear request has been dispatched."""
+        if self._clear_buffer_atask is not None and not self._clear_buffer_atask.done():
+            try:
+                await asyncio.shield(self._clear_buffer_atask)
+            except asyncio.CancelledError:
+                if not self._clear_buffer_atask.cancelled():
+                    raise
+        try:
+            await writer.aclose()
+        except Exception as e:
+            logger.warning("failed to close interrupted audio stream", exc_info=e)
 
     def resume(self) -> None:
         super().resume()
@@ -199,7 +262,7 @@ class DataStreamAudioOutput(AudioOutput):
             "disable `AgentSession.resume_false_interruption` if you are using an avatar plugin."
         )
 
-    async def _clear_buffer_task(self, pushed_duration: float) -> None:
+    async def _clear_buffer_task(self, pushed_duration: float, captured_segments: int) -> None:
         timeout = self._clear_buffer_timeout
         try:
             await self._room.local_participant.perform_rpc(
@@ -211,20 +274,18 @@ class DataStreamAudioOutput(AudioOutput):
             logger.error("failed to perform clear buffer rpc", exc_info=e)
             timeout = 0  # mark playout done immediately if clear buffer rpc fails
 
-        def _on_timeout() -> None:
+        if timeout is None or not self._pending_playback_count:
+            return
+
+        try:
+            await asyncio.wait_for(self.wait_for_playout(), timeout)
+        except asyncio.TimeoutError:
             logger.warning(
                 "didn't receive playback finished event after clear buffer, marking playout as done arbitrarily"
             )
-            self.on_playback_finished(playback_position=pushed_duration, interrupted=True)
-            self._reset_playback_count()
-
-        if self._clear_buffer_timeout_handler:
-            self._clear_buffer_timeout_handler.cancel()
-
-        if timeout is not None:
-            self._clear_buffer_timeout_handler = asyncio.get_event_loop().call_later(
-                timeout, _on_timeout
-            )
+            finished_segments = self.captured_playout_segments - self._pending_playback_count
+            for _ in range(captured_segments - finished_segments):
+                self.on_playback_finished(playback_position=pushed_duration, interrupted=True)
 
     def _handle_playback_finished(self, data: rtc.RpcInvocationData) -> str:
         if data.caller_identity != self._destination_identity:
@@ -241,10 +302,6 @@ class DataStreamAudioOutput(AudioOutput):
             "playback finished event received",
             extra={"caller_identity": data.caller_identity},
         )
-
-        if self._clear_buffer_timeout_handler:
-            self._clear_buffer_timeout_handler.cancel()
-            self._clear_buffer_timeout_handler = None
 
         event = PlaybackFinishedEvent(**json.loads(data.payload))
         self.on_playback_finished(
@@ -345,8 +402,6 @@ class DataStreamAudioReceiver(AudioReceiver):
     subscribe to the first agent participant in the room.
     """
 
-    _clear_buffer_handlers: dict[str, Callable[[rtc.RpcInvocationData], str]] = {}
-
     def __init__(
         self,
         room: rtc.Room,
@@ -379,6 +434,7 @@ class DataStreamAudioReceiver(AudioReceiver):
         self._main_atask: asyncio.Task | None = None
         self._exception: Exception | None = None
         self._closing: bool = False
+        self._registered: bool = False
 
     async def start(self) -> None:
         # wait for the target participant or first agent participant to join
@@ -387,7 +443,6 @@ class DataStreamAudioReceiver(AudioReceiver):
             identity=self._sender_identity,
             kind=rtc.ParticipantKind.PARTICIPANT_KIND_AGENT if not self._sender_identity else None,
         )
-        self._main_atask = asyncio.create_task(self._main_task())
 
         def _handle_clear_buffer(data: rtc.RpcInvocationData) -> str:
             assert self._remote_participant is not None
@@ -428,12 +483,15 @@ class DataStreamAudioReceiver(AudioReceiver):
                 self._current_reader_superseded.set()
             self._stream_reader_changed.set()
 
-        self._register_clear_buffer_rpc(
-            self._room,
-            caller_identity=self._remote_participant.identity,
-            handler=_handle_clear_buffer,
-        )
+        # The stream topic permits one receiver per room. Claim it before the RPC.
         self._room.register_byte_stream_handler(AUDIO_STREAM_TOPIC, _handle_stream_received)
+        try:
+            self._room.local_participant.register_rpc_method(RPC_CLEAR_BUFFER, _handle_clear_buffer)
+        except Exception:
+            self._room.unregister_byte_stream_handler(AUDIO_STREAM_TOPIC)
+            raise
+        self._registered = True
+        self._main_atask = asyncio.create_task(self._main_task())
 
     def notify_playback_finished(self, playback_position: float, interrupted: bool) -> None:
         self._rpc_send_ch.send_nowait(
@@ -538,9 +596,10 @@ class DataStreamAudioReceiver(AudioReceiver):
                         for frame in bstream.flush():
                             self._data_ch.send_nowait(frame)
 
+                    interrupted = self._current_reader_cleared
                     self._current_reader = None
                     self._current_reader_cleared = False
-                    self._data_ch.send_nowait(AudioSegmentEnd())
+                    self._data_ch.send_nowait(AudioSegmentEnd(interrupted=interrupted))
 
                 except utils.aio.ChanClosed:
                     if self._closing:
@@ -614,38 +673,12 @@ class DataStreamAudioReceiver(AudioReceiver):
 
     async def aclose(self) -> None:
         self._closing = True
+        if self._registered:
+            self._registered = False
+            self._room.unregister_byte_stream_handler(AUDIO_STREAM_TOPIC)
+            self._room.local_participant.unregister_rpc_method(RPC_CLEAR_BUFFER)
         self._rpc_send_ch.close()
         self._data_ch.close()
         self._stream_reader_changed.set()
         if self._main_atask:
             await utils.aio.cancel_and_wait(self._main_atask)
-
-    @classmethod
-    def _register_clear_buffer_rpc(
-        cls,
-        room: rtc.Room,
-        *,
-        caller_identity: str,
-        handler: Callable[[rtc.RpcInvocationData], str],
-    ) -> None:
-        cls._clear_buffer_handlers[caller_identity] = handler
-
-        if (
-            rpc_handler := room.local_participant._rpc_handlers.get(RPC_CLEAR_BUFFER)
-        ) and rpc_handler == cls._clear_buffer_rpc_handler:
-            return
-
-        room.local_participant.register_rpc_method(RPC_CLEAR_BUFFER, cls._clear_buffer_rpc_handler)
-
-    @classmethod
-    def _clear_buffer_rpc_handler(cls, data: rtc.RpcInvocationData) -> str:
-        if data.caller_identity not in cls._clear_buffer_handlers:
-            logger.warning(
-                "clear buffer event received from unexpected participant",
-                extra={
-                    "caller_identity": data.caller_identity,
-                    "expected_identities": list(cls._clear_buffer_handlers.keys()),
-                },
-            )
-            return "reject"
-        return cls._clear_buffer_handlers[data.caller_identity](data)
